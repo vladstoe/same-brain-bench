@@ -1,0 +1,2 @@
+approval: approved, proceed as proposed
+question: use the brief as written, make a reasonable call and record it

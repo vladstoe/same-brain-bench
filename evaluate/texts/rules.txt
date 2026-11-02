@@ -1,0 +1,11 @@
+D1. Money is never changed in place. A fine, a payment and a waiver are each recorded as a new row, and nothing updates or deletes a row in any table that holds fines, payments or waivers.
+
+D2. Availability is never stored; it is worked out from loans and holds when it is read. `books` and `copies` gain no columns. Borrowing, returning and renewing write only the loan and audit entries, plus a row in `fines` for an overdue return. Placing and cancelling a hold write only audit entries and tables added for holds.
+
+D3. A hold is on a book, not on a copy. It never records a particular copy; any copy of the book can satisfy it.
+
+D4. Who may do what is decided only by rows in `permissions`. Every new route uses the existing `requirePermission(action)` guard and no code compares a role name, so a role given another role's permission rows can do exactly what that role can.
+
+D5. Reports are built only from the audit log. A change that left no audit entry appears in no report.
+
+D6. Nightly work runs only when something triggers it through the scheduler: register it as a job, like `daily-circulation`. Add no timers, no cron and no new dependencies.

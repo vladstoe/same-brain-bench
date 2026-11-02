@@ -1,0 +1,13 @@
+{
+  "model": "SYNTHETIC-TEST-MODEL",
+  "currency": "USD",
+  "unit": "per million tokens",
+  "source": "synthetic values for exercising the pricing function; not a real price list",
+  "verifiedOn": "1970-01-01",
+  "placeholder": false,
+  "input": 10,
+  "output": 100,
+  "cacheRead": 1,
+  "cacheWrite5m": 20,
+  "cacheWrite1h": 40
+}

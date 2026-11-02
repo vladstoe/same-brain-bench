@@ -1,0 +1,801 @@
+Fixture: missing-weekly-window — compliant, except that the weekly report counts only the current day while stating the seven-day period.
+
+diff --git a/src/accounts.ts b/src/accounts.ts
+index 73c8f57..a78141e 100644
+--- a/src/accounts.ts
++++ b/src/accounts.ts
+@@ -21,10 +21,13 @@ export function memberAccount(db: Db, memberId: number): MemberAccount {
+             - COALESCE((SELECT SUM(payments.amount_cents)
+                         FROM payments JOIN fines AS paid ON paid.id = payments.fine_id
+                         WHERE paid.member_id = ?), 0)
++            - COALESCE((SELECT SUM(waivers.amount_cents)
++                        FROM waivers JOIN fines AS waived ON waived.id = waivers.fine_id
++                        WHERE waived.member_id = ?), 0)
+        FROM fines WHERE fines.member_id = ?`,
+     )
+     .pluck()
+-    .get(memberId, memberId) as number;
++    .get(memberId, memberId, memberId) as number;
+ 
+   const blocks: string[] = [];
+   if (openLoans >= MAX_OPEN_LOANS) {
+diff --git a/src/app.ts b/src/app.ts
+index 34ad6d6..9f4b8f7 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -9,6 +9,7 @@ import { authors } from './routes/authors.js';
+ import { books } from './routes/books.js';
+ import { copies } from './routes/copies.js';
+ import { fines } from './routes/fines.js';
++import { holds } from './routes/holds.js';
+ import { jobs } from './routes/jobs.js';
+ import { loans } from './routes/loans.js';
+ import { members } from './routes/members.js';
+@@ -36,6 +37,7 @@ export function createApp(db: Db, options: AppOptions = {}): Hono<AppEnv> {
+   app.route('/', members);
+   app.route('/', permissions);
+   app.route('/', loans);
++  app.route('/', holds);
+   app.route('/', fines);
+   app.route('/', payments);
+   app.route('/', reports);
+diff --git a/src/clock.ts b/src/clock.ts
+index 22ca151..efd3c0f 100644
+--- a/src/clock.ts
++++ b/src/clock.ts
+@@ -1,6 +1,6 @@
+ export type Clock = () => Date;
+ 
+-const DAY_MS = 24 * 60 * 60 * 1000;
++export const DAY_MS = 24 * 60 * 60 * 1000;
+ 
+ export const systemClock: Clock = () => new Date();
+ 
+diff --git a/src/config.ts b/src/config.ts
+index 9282e41..2eb6bc1 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -1,6 +1,8 @@
+ export const LOAN_PERIOD_DAYS = 14;
+ export const MAX_OPEN_LOANS = 10;
+ export const OUTSTANDING_BALANCE_LIMIT_CENTS = 1000;
++export const OVERDUE_FINE_CENTS_PER_DAY = 25;
++export const MAX_RENEWALS = 2;
+ 
+ export function requireEnv(name: string): string {
+   const value = process.env[name];
+diff --git a/src/guards.ts b/src/guards.ts
+index 925ca3b..cb85224 100644
+--- a/src/guards.ts
++++ b/src/guards.ts
+@@ -1,7 +1,14 @@
+ import { createMiddleware } from 'hono/factory';
+-import type { AppEnv } from './db.js';
++import type { AppEnv, Db } from './db.js';
+ import type { Member } from './types.js';
+ 
++export function hasPermission(db: Db, member: Member, action: string): boolean {
++  return (
++    db.prepare('SELECT 1 FROM permissions WHERE role = ? AND action = ?').get(member.role, action) !==
++    undefined
++  );
++}
++
+ export function requirePermission(action: string) {
+   return createMiddleware<AppEnv>(async (c, next) => {
+     const header = c.req.header('x-member-id');
+@@ -18,10 +25,7 @@ export function requirePermission(action: string) {
+       return c.json({ error: 'x-member-id does not match a member' }, 403);
+     }
+ 
+-    const granted = db
+-      .prepare('SELECT 1 FROM permissions WHERE role = ? AND action = ?')
+-      .get(member.role, action);
+-    if (!granted) {
++    if (!hasPermission(db, member, action)) {
+       return c.json({ error: `${action} permission required` }, 403);
+     }
+ 
+diff --git a/src/jobs/index.ts b/src/jobs/index.ts
+index 2429f1d..9e202e9 100644
+--- a/src/jobs/index.ts
++++ b/src/jobs/index.ts
+@@ -1,4 +1,8 @@
+ import { register } from '../scheduler.js';
+ import { DAILY_CIRCULATION, dailyCirculation } from './daily-circulation.js';
++import { NIGHTLY_RECONCILE, nightlyReconcile } from './nightly-reconcile.js';
++import { WEEKLY_SUMMARY, weeklySummary } from './weekly-summary.js';
+ 
+ register(DAILY_CIRCULATION, dailyCirculation);
++register(NIGHTLY_RECONCILE, nightlyReconcile);
++register(WEEKLY_SUMMARY, weeklySummary);
+diff --git a/src/jobs/nightly-reconcile.ts b/src/jobs/nightly-reconcile.ts
+new file mode 100644
+index 0000000..58a6b11
+--- /dev/null
++++ b/src/jobs/nightly-reconcile.ts
+@@ -0,0 +1,63 @@
++import { dayRange, utcDay } from '../clock.js';
++import type { JobContext } from '../scheduler.js';
++
++export const NIGHTLY_RECONCILE = 'nightly-reconcile';
++
++export type NightlyReconcileBody = {
++  period: string;
++  borrows: number;
++  returns: number;
++  holds_placed: number;
++  holds_cancelled: number;
++  fines_charged: number;
++  fines_charged_cents: number;
++  fines_waived: number;
++  fines_waived_cents: number;
++};
++
++type ActionTotals = { action: string; count: number; cents: number };
++
++const COUNTED_ACTIONS = [
++  'loan.borrowed',
++  'loan.returned',
++  'hold.placed',
++  'hold.cancelled',
++  'fine.charged',
++  'fine.waived',
++];
++
++export function nightlyReconcile({ db, now }: JobContext): { report_id: number; period: string } {
++  const period = utcDay(now);
++  const { start, end } = dayRange(period);
++
++  const rows = db
++    .prepare(
++      `SELECT action,
++              COUNT(*) AS count,
++              COALESCE(SUM(json_extract(data, '$.amount_cents')), 0) AS cents
++       FROM audit_log
++       WHERE at >= ? AND at < ?
++         AND action IN (${COUNTED_ACTIONS.map(() => '?').join(', ')})
++       GROUP BY action`,
++    )
++    .all(start, end, ...COUNTED_ACTIONS) as ActionTotals[];
++  const totals = new Map(rows.map((row) => [row.action, row]));
++
++  const body: NightlyReconcileBody = {
++    period,
++    borrows: totals.get('loan.borrowed')?.count ?? 0,
++    returns: totals.get('loan.returned')?.count ?? 0,
++    holds_placed: totals.get('hold.placed')?.count ?? 0,
++    holds_cancelled: totals.get('hold.cancelled')?.count ?? 0,
++    fines_charged: totals.get('fine.charged')?.count ?? 0,
++    fines_charged_cents: totals.get('fine.charged')?.cents ?? 0,
++    fines_waived: totals.get('fine.waived')?.count ?? 0,
++    fines_waived_cents: totals.get('fine.waived')?.cents ?? 0,
++  };
++
++  const result = db
++    .prepare('INSERT INTO reports (kind, period, generated_at, body) VALUES (?, ?, ?, ?)')
++    .run(NIGHTLY_RECONCILE, period, now.toISOString(), JSON.stringify(body));
++
++  return { report_id: Number(result.lastInsertRowid), period };
++}
+diff --git a/src/jobs/weekly-summary.ts b/src/jobs/weekly-summary.ts
+new file mode 100644
+index 0000000..9de8132
+--- /dev/null
++++ b/src/jobs/weekly-summary.ts
+@@ -0,0 +1,67 @@
++import { addDays, utcDay } from '../clock.js';
++import type { JobContext } from '../scheduler.js';
++
++export const WEEKLY_SUMMARY = 'weekly-summary';
++
++export type WeeklySummaryBody = {
++  period_start: string;
++  period_end: string;
++  borrows: number;
++  returns: number;
++  holds_placed: number;
++  holds_cancelled: number;
++  fines_charged: number;
++  fines_charged_cents: number;
++  fines_waived: number;
++  fines_waived_cents: number;
++};
++
++type ActionTotals = { action: string; count: number; cents: number };
++
++const COUNTED_ACTIONS = [
++  'loan.borrowed',
++  'loan.returned',
++  'hold.placed',
++  'hold.cancelled',
++  'fine.charged',
++  'fine.waived',
++];
++
++export function weeklySummary({ db, now }: JobContext): { report_id: number; period: string } {
++  const period = utcDay(now);
++  const periodStart = utcDay(new Date(addDays(`${period}T00:00:00.000Z`, -6)));
++  const start = `${period}T00:00:00.000Z`;
++  const end = addDays(`${period}T00:00:00.000Z`, 1);
++
++  const rows = db
++    .prepare(
++      `SELECT action,
++              COUNT(*) AS count,
++              COALESCE(SUM(json_extract(data, '$.amount_cents')), 0) AS cents
++       FROM audit_log
++       WHERE at >= ? AND at < ?
++         AND action IN (${COUNTED_ACTIONS.map(() => '?').join(', ')})
++       GROUP BY action`,
++    )
++    .all(start, end, ...COUNTED_ACTIONS) as ActionTotals[];
++  const totals = new Map(rows.map((row) => [row.action, row]));
++
++  const body: WeeklySummaryBody = {
++    period_start: periodStart,
++    period_end: period,
++    borrows: totals.get('loan.borrowed')?.count ?? 0,
++    returns: totals.get('loan.returned')?.count ?? 0,
++    holds_placed: totals.get('hold.placed')?.count ?? 0,
++    holds_cancelled: totals.get('hold.cancelled')?.count ?? 0,
++    fines_charged: totals.get('fine.charged')?.count ?? 0,
++    fines_charged_cents: totals.get('fine.charged')?.cents ?? 0,
++    fines_waived: totals.get('fine.waived')?.count ?? 0,
++    fines_waived_cents: totals.get('fine.waived')?.cents ?? 0,
++  };
++
++  const result = db
++    .prepare('INSERT INTO reports (kind, period, generated_at, body) VALUES (?, ?, ?, ?)')
++    .run(WEEKLY_SUMMARY, period, now.toISOString(), JSON.stringify(body));
++
++  return { report_id: Number(result.lastInsertRowid), period };
++}
+diff --git a/src/migrations/008_holds.sql b/src/migrations/008_holds.sql
+new file mode 100644
+index 0000000..a8ede87
+--- /dev/null
++++ b/src/migrations/008_holds.sql
+@@ -0,0 +1,30 @@
++CREATE TABLE holds (
++  id INTEGER PRIMARY KEY,
++  book_id INTEGER NOT NULL REFERENCES books(id),
++  member_id INTEGER NOT NULL REFERENCES members(id),
++  placed_at TEXT NOT NULL,
++  cancelled_at TEXT
++);
++
++CREATE INDEX holds_book_id ON holds(book_id);
++
++CREATE UNIQUE INDEX holds_active_member_book ON holds(member_id, book_id)
++  WHERE cancelled_at IS NULL;
++
++INSERT INTO permissions (role, action) VALUES
++  ('patron', 'holds.place'),
++  ('patron', 'holds.cancel'),
++  ('patron', 'holds.read'),
++  ('clerk', 'holds.place'),
++  ('clerk', 'holds.cancel'),
++  ('clerk', 'holds.read'),
++  ('librarian', 'holds.place'),
++  ('librarian', 'holds.cancel'),
++  ('librarian', 'holds.cancel_any'),
++  ('librarian', 'holds.read'),
++  ('librarian', 'holds.read_any'),
++  ('admin', 'holds.place'),
++  ('admin', 'holds.cancel'),
++  ('admin', 'holds.cancel_any'),
++  ('admin', 'holds.read'),
++  ('admin', 'holds.read_any');
+diff --git a/src/migrations/009_waivers.sql b/src/migrations/009_waivers.sql
+new file mode 100644
+index 0000000..0a34344
+--- /dev/null
++++ b/src/migrations/009_waivers.sql
+@@ -0,0 +1,13 @@
++CREATE TABLE waivers (
++  id INTEGER PRIMARY KEY,
++  fine_id INTEGER NOT NULL REFERENCES fines(id),
++  amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
++  waived_at TEXT NOT NULL,
++  waived_by INTEGER NOT NULL REFERENCES members(id)
++);
++
++CREATE INDEX waivers_fine_id ON waivers(fine_id);
++
++INSERT INTO permissions (role, action) VALUES
++  ('librarian', 'fines.waive'),
++  ('admin', 'fines.waive');
+diff --git a/src/migrations/010_loan_renewals.sql b/src/migrations/010_loan_renewals.sql
+new file mode 100644
+index 0000000..b1d57dd
+--- /dev/null
++++ b/src/migrations/010_loan_renewals.sql
+@@ -0,0 +1 @@
++ALTER TABLE loans ADD COLUMN renewal_count INTEGER NOT NULL DEFAULT 0;
+diff --git a/src/migrations/011_member_suspension.sql b/src/migrations/011_member_suspension.sql
+new file mode 100644
+index 0000000..8f688da
+--- /dev/null
++++ b/src/migrations/011_member_suspension.sql
+@@ -0,0 +1,5 @@
++ALTER TABLE members ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0;
++
++INSERT INTO permissions (role, action) VALUES
++  ('librarian', 'members.suspend'),
++  ('admin', 'members.suspend');
+diff --git a/src/migrations/012_statements.sql b/src/migrations/012_statements.sql
+new file mode 100644
+index 0000000..05638bc
+--- /dev/null
++++ b/src/migrations/012_statements.sql
+@@ -0,0 +1,7 @@
++INSERT INTO permissions (role, action) VALUES
++  ('patron', 'statements.read'),
++  ('clerk', 'statements.read'),
++  ('librarian', 'statements.read'),
++  ('librarian', 'statements.read_any'),
++  ('admin', 'statements.read'),
++  ('admin', 'statements.read_any');
+diff --git a/src/routes/fines.ts b/src/routes/fines.ts
+index 106cba1..ae3cf47 100644
+--- a/src/routes/fines.ts
++++ b/src/routes/fines.ts
+@@ -1,10 +1,13 @@
+ import { Hono } from 'hono';
++import { memberAccount } from '../accounts.js';
+ import { recordAudit } from '../audit.js';
+ import type { AppEnv, Db } from '../db.js';
+-import { requirePermission } from '../guards.js';
++import { hasPermission, requirePermission } from '../guards.js';
+ import {
+   badRequest,
+   centsField,
++  conflict,
++  HttpError,
+   idParam,
+   notFound,
+   now,
+@@ -19,12 +22,17 @@ import { findMember } from './members.js';
+ 
+ export const fines = new Hono<AppEnv>();
+ 
+-type FineWithBalance = Fine & { paid_cents: number; balance_cents: number };
++type FineWithBalance = Fine & { paid_cents: number; waived_cents: number; balance_cents: number };
++
++const WAIVED_CENTS = `
++  (SELECT COALESCE(SUM(waivers.amount_cents), 0) FROM waivers WHERE waivers.fine_id = fines.id)`;
+ 
+ const SELECT_FINE_WITH_BALANCE = `
+   SELECT fines.*,
+          COALESCE(SUM(payments.amount_cents), 0) AS paid_cents,
+-         fines.amount_cents - COALESCE(SUM(payments.amount_cents), 0) AS balance_cents
++         ${WAIVED_CENTS} AS waived_cents,
++         fines.amount_cents - COALESCE(SUM(payments.amount_cents), 0) - ${WAIVED_CENTS}
++           AS balance_cents
+   FROM fines
+   LEFT JOIN payments ON payments.fine_id = fines.id`;
+ 
+@@ -124,3 +132,51 @@ fines.get('/fines/:id', requirePermission('fines.read'), (c) => {
+     .all(fine.id) as Payment[];
+   return c.json({ ...fine, payments: finePayments });
+ });
++
++fines.post('/fines/:id/waive', requirePermission('fines.waive'), (c) => {
++  const fineId = idParam(c);
++  const db = c.get('db');
++  const waivedAt = now(c);
++  const waivedBy = c.get('member').id;
++
++  const fine = db.transaction(() => {
++    const before = findFine(db, fineId);
++    if (before.balance_cents <= 0) {
++      throw conflict('nothing is left to waive on this fine');
++    }
++
++    const result = db
++      .prepare(
++        'INSERT INTO waivers (fine_id, amount_cents, waived_at, waived_by) VALUES (?, ?, ?, ?)',
++      )
++      .run(fineId, before.balance_cents, waivedAt, waivedBy);
++    recordAudit(c, {
++      action: 'fine.waived',
++      entity: 'waiver',
++      entityId: Number(result.lastInsertRowid),
++      data: { fine_id: fineId, member_id: before.member_id, amount_cents: before.balance_cents },
++    });
++    return findFine(db, fineId);
++  })();
++
++  return c.json(fine);
++});
++
++fines.get('/members/:id/statement', requirePermission('statements.read'), (c) => {
++  const id = idParam(c);
++  const db = c.get('db');
++  const caller = c.get('member');
++  if (id !== caller.id && !hasPermission(db, caller, 'statements.read_any')) {
++    throw new HttpError(403, 'statements.read_any permission required');
++  }
++  const member = findMember(db, id);
++  const rows = db
++    .prepare(
++      `${SELECT_FINE_WITH_BALANCE}
++       WHERE fines.member_id = ?
++       GROUP BY fines.id
++       ORDER BY fines.created_at DESC, fines.id DESC`,
++    )
++    .all(member.id) as FineWithBalance[];
++  return c.json({ balance_cents: memberAccount(db, member.id).balance_cents, fines: rows });
++});
+diff --git a/src/routes/holds.ts b/src/routes/holds.ts
+new file mode 100644
+index 0000000..3c4c9e1
+--- /dev/null
++++ b/src/routes/holds.ts
+@@ -0,0 +1,105 @@
++import { Hono } from 'hono';
++import { recordAudit } from '../audit.js';
++import type { AppEnv, Db } from '../db.js';
++import { hasPermission, requirePermission } from '../guards.js';
++import { conflict, HttpError, idParam, notFound, now } from '../http.js';
++import type { Hold } from '../types.js';
++import { findBook } from './books.js';
++import { findMember, isSuspended } from './members.js';
++
++export const holds = new Hono<AppEnv>();
++
++export function findHold(db: Db, id: number): Hold {
++  const hold = db.prepare('SELECT * FROM holds WHERE id = ?').get(id) as Hold | undefined;
++  if (!hold) {
++    throw notFound('hold not found');
++  }
++  return hold;
++}
++
++holds.post('/books/:id/holds', requirePermission('holds.place'), (c) => {
++  const bookId = idParam(c);
++  const db = c.get('db');
++  const member = c.get('member');
++  const placedAt = now(c);
++
++  const hold = db.transaction(() => {
++    findBook(db, bookId);
++    if (isSuspended(db, member.id)) {
++      throw conflict('member is suspended');
++    }
++    const active = db
++      .prepare('SELECT 1 FROM holds WHERE member_id = ? AND book_id = ? AND cancelled_at IS NULL')
++      .get(member.id, bookId);
++    if (active) {
++      throw conflict('member already has an active hold on this book');
++    }
++
++    const result = db
++      .prepare('INSERT INTO holds (book_id, member_id, placed_at) VALUES (?, ?, ?)')
++      .run(bookId, member.id, placedAt);
++    const id = Number(result.lastInsertRowid);
++    recordAudit(c, {
++      action: 'hold.placed',
++      entity: 'hold',
++      entityId: id,
++      data: { book_id: bookId, member_id: member.id },
++    });
++    return findHold(db, id);
++  })();
++
++  return c.json(hold, 201);
++});
++
++holds.post('/holds/:id/cancel', requirePermission('holds.cancel'), (c) => {
++  const id = idParam(c);
++  const db = c.get('db');
++  const member = c.get('member');
++  const cancelledAt = now(c);
++
++  const hold = db.transaction(() => {
++    const before = findHold(db, id);
++    if (before.member_id !== member.id && !hasPermission(db, member, 'holds.cancel_any')) {
++      throw new HttpError(403, 'holds.cancel_any permission required');
++    }
++    if (before.cancelled_at !== null) {
++      throw conflict('hold is already cancelled');
++    }
++
++    db.prepare('UPDATE holds SET cancelled_at = ? WHERE id = ?').run(cancelledAt, id);
++    recordAudit(c, {
++      action: 'hold.cancelled',
++      entity: 'hold',
++      entityId: id,
++      data: { book_id: before.book_id, member_id: before.member_id },
++    });
++    return findHold(db, id);
++  })();
++
++  return c.json(hold);
++});
++
++const SELECT_ACTIVE_HOLDS = 'SELECT * FROM holds WHERE cancelled_at IS NULL';
++
++holds.get('/books/:id/holds', requirePermission('holds.read_any'), (c) => {
++  const db = c.get('db');
++  const book = findBook(db, idParam(c));
++  const rows = db
++    .prepare(`${SELECT_ACTIVE_HOLDS} AND book_id = ? ORDER BY placed_at, id`)
++    .all(book.id) as Hold[];
++  return c.json(rows);
++});
++
++holds.get('/members/:id/holds', requirePermission('holds.read'), (c) => {
++  const id = idParam(c);
++  const db = c.get('db');
++  const caller = c.get('member');
++  if (id !== caller.id && !hasPermission(db, caller, 'holds.read_any')) {
++    throw new HttpError(403, 'holds.read_any permission required');
++  }
++  const member = findMember(db, id);
++  const rows = db
++    .prepare(`${SELECT_ACTIVE_HOLDS} AND member_id = ? ORDER BY placed_at, id`)
++    .all(member.id) as Hold[];
++  return c.json(rows);
++});
+diff --git a/src/routes/loans.ts b/src/routes/loans.ts
+index 84d6672..327147e 100644
+--- a/src/routes/loans.ts
++++ b/src/routes/loans.ts
+@@ -1,15 +1,15 @@
+-import { Hono } from 'hono';
++import { Hono, type Context } from 'hono';
+ import { memberAccount } from '../accounts.js';
+ import { recordAudit } from '../audit.js';
+-import { addDays } from '../clock.js';
+-import { LOAN_PERIOD_DAYS } from '../config.js';
++import { addDays, DAY_MS } from '../clock.js';
++import { LOAN_PERIOD_DAYS, MAX_RENEWALS, OVERDUE_FINE_CENTS_PER_DAY } from '../config.js';
+ import type { AppEnv, Db } from '../db.js';
+ import { requirePermission } from '../guards.js';
+ import { badRequest, conflict, idField, idParam, notFound, now, readJson } from '../http.js';
+ import { Filters, idQuery, page } from '../query.js';
+ import type { Loan } from '../types.js';
+ import { findCopy } from './copies.js';
+-import { findMember } from './members.js';
++import { findMember, isSuspended } from './members.js';
+ 
+ export const loans = new Hono<AppEnv>();
+ 
+@@ -50,6 +50,29 @@ function findOpenLoan(db: Db, id: number): Loan {
+   return loan;
+ }
+ 
++function chargeOverdueFine(c: Context<AppEnv>, loan: Loan, returnedAt: string): void {
++  const daysLate = Math.floor((Date.parse(returnedAt) - Date.parse(loan.due_at)) / DAY_MS);
++  if (daysLate < 1) {
++    return;
++  }
++
++  const amountCents = daysLate * OVERDUE_FINE_CENTS_PER_DAY;
++  const reason = `returned ${daysLate} day${daysLate === 1 ? '' : 's'} late`;
++  const result = c
++    .get('db')
++    .prepare(
++      `INSERT INTO fines (member_id, loan_id, amount_cents, reason, created_at)
++       VALUES (?, ?, ?, ?, ?)`,
++    )
++    .run(loan.member_id, loan.id, amountCents, reason, returnedAt);
++  recordAudit(c, {
++    action: 'fine.charged',
++    entity: 'fine',
++    entityId: Number(result.lastInsertRowid),
++    data: { member_id: loan.member_id, loan_id: loan.id, amount_cents: amountCents, reason },
++  });
++}
++
+ loans.post('/loans', requirePermission('loans.write'), async (c) => {
+   const body = await readJson(c);
+   const copyId = idField(body, 'copy_id');
+@@ -61,6 +84,9 @@ loans.post('/loans', requirePermission('loans.write'), async (c) => {
+   const loan = db.transaction(() => {
+     const copy = findCopy(db, copyId);
+     findMember(db, memberId);
++    if (isSuspended(db, memberId)) {
++      throw conflict('member is suspended');
++    }
+     if (copy.withdrawn_at !== null) {
+       throw conflict('copy is withdrawn');
+     }
+@@ -137,6 +163,7 @@ loans.post('/loans/:id/return', requirePermission('loans.write'), (c) => {
+       entityId: id,
+       data: { copy_id: open.copy_id, member_id: open.member_id, due_at: open.due_at },
+     });
++    chargeOverdueFine(c, open, returnedAt);
+     return findLoan(db, id);
+   })();
+ 
+@@ -149,8 +176,23 @@ loans.post('/loans/:id/renew', requirePermission('loans.write'), (c) => {
+ 
+   const loan = db.transaction(() => {
+     const open = findOpenLoan(db, id);
++    if (open.renewal_count >= MAX_RENEWALS) {
++      throw conflict(`loan has already been renewed ${MAX_RENEWALS} times`);
++    }
++    const heldByOther = db
++      .prepare(
++        `SELECT 1 FROM holds JOIN copies ON copies.book_id = holds.book_id
++         WHERE copies.id = ? AND holds.member_id != ? AND holds.cancelled_at IS NULL`,
++      )
++      .get(open.copy_id, open.member_id);
++    if (heldByOther) {
++      throw conflict('another member has a hold on this book');
++    }
+     const dueAt = addDays(open.due_at, LOAN_PERIOD_DAYS);
+-    db.prepare('UPDATE loans SET due_at = ? WHERE id = ?').run(dueAt, id);
++    db.prepare('UPDATE loans SET due_at = ?, renewal_count = renewal_count + 1 WHERE id = ?').run(
++      dueAt,
++      id,
++    );
+     recordAudit(c, {
+       action: 'loan.renewed',
+       entity: 'loan',
+diff --git a/src/routes/members.ts b/src/routes/members.ts
+index 4b7f3df..a087b4d 100644
+--- a/src/routes/members.ts
++++ b/src/routes/members.ts
+@@ -1,4 +1,4 @@
+-import { Hono } from 'hono';
++import { Hono, type Context } from 'hono';
+ import { memberAccount } from '../accounts.js';
+ import { recordAudit } from '../audit.js';
+ import type { AppEnv, Db } from '../db.js';
+@@ -28,12 +28,22 @@ function roleField(body: JsonObject): MemberRole {
+   return body.role;
+ }
+ 
++type MemberRow = Omit<Member, 'suspended'> & { suspended: number };
++
++function present(row: MemberRow): Member {
++  return { ...row, suspended: row.suspended === 1 };
++}
++
+ export function findMember(db: Db, id: number): Member {
+-  const member = db.prepare('SELECT * FROM members WHERE id = ?').get(id) as Member | undefined;
+-  if (!member) {
++  const row = db.prepare('SELECT * FROM members WHERE id = ?').get(id) as MemberRow | undefined;
++  if (!row) {
+     throw notFound('member not found');
+   }
+-  return member;
++  return present(row);
++}
++
++export function isSuspended(db: Db, id: number): boolean {
++  return findMember(db, id).suspended;
+ }
+ 
+ members.get('/members', requirePermission('members.read'), (c) => {
+@@ -51,8 +61,8 @@ members.get('/members', requirePermission('members.read'), (c) => {
+   const rows = c
+     .get('db')
+     .prepare(`SELECT * FROM members ${filters.where} ORDER BY name, id ${sql}`)
+-    .all(...filters.params, ...params) as Member[];
+-  return c.json(rows);
++    .all(...filters.params, ...params) as MemberRow[];
++  return c.json(rows.map(present));
+ });
+ 
+ members.post('/members', requirePermission('members.write'), async (c) => {
+@@ -136,3 +146,30 @@ members.delete('/members/:id', requirePermission('members.write'), (c) => {
+ 
+   return c.body(null, 204);
+ });
++
++function setSuspended(suspended: boolean) {
++  return (c: Context<AppEnv>) => {
++    const id = idParam(c);
++    const db = c.get('db');
++
++    const member = db.transaction(() => {
++      const before = findMember(db, id);
++      if (before.suspended === suspended) {
++        throw conflict(suspended ? 'member is already suspended' : 'member is not suspended');
++      }
++      db.prepare('UPDATE members SET suspended = ? WHERE id = ?').run(suspended ? 1 : 0, id);
++      recordAudit(c, {
++        action: suspended ? 'member.suspended' : 'member.unsuspended',
++        entity: 'member',
++        entityId: id,
++        data: {},
++      });
++      return findMember(db, id);
++    })();
++
++    return c.json(member);
++  };
++}
++
++members.post('/members/:id/suspend', requirePermission('members.suspend'), setSuspended(true));
++members.post('/members/:id/unsuspend', requirePermission('members.suspend'), setSuspended(false));
+diff --git a/src/routes/reports.ts b/src/routes/reports.ts
+index 21ba2b7..e8b2d00 100644
+--- a/src/routes/reports.ts
++++ b/src/routes/reports.ts
+@@ -5,6 +5,8 @@ import type { AppEnv, Db } from '../db.js';
+ import { requirePermission } from '../guards.js';
+ import { badRequest, idParam, notFound } from '../http.js';
+ import { DAILY_CIRCULATION } from '../jobs/daily-circulation.js';
++import { NIGHTLY_RECONCILE } from '../jobs/nightly-reconcile.js';
++import { WEEKLY_SUMMARY } from '../jobs/weekly-summary.js';
+ import { Filters, page } from '../query.js';
+ import type { Report } from '../types.js';
+ 
+@@ -58,6 +60,28 @@ reports.get('/reports/daily/latest', requirePermission('reports.read'), (c) => {
+   return c.json(present(report));
+ });
+ 
++reports.get('/reports/nightly/latest', requirePermission('reports.read'), (c) => {
++  const report = c
++    .get('db')
++    .prepare('SELECT * FROM reports WHERE kind = ? ORDER BY generated_at DESC, id DESC LIMIT 1')
++    .get(NIGHTLY_RECONCILE) as Report | undefined;
++  if (!report) {
++    throw notFound('no nightly report has been generated yet');
++  }
++  return c.json(present(report));
++});
++
++reports.get('/reports/weekly/latest', requirePermission('reports.read'), (c) => {
++  const report = c
++    .get('db')
++    .prepare('SELECT * FROM reports WHERE kind = ? ORDER BY generated_at DESC, id DESC LIMIT 1')
++    .get(WEEKLY_SUMMARY) as Report | undefined;
++  if (!report) {
++    throw notFound('no weekly report has been generated yet');
++  }
++  return c.json(present(report));
++});
++
+ reports.get('/reports/:id', requirePermission('reports.read'), (c) => {
+   return c.json(present(findReport(c.get('db'), idParam(c))));
+ });
+diff --git a/src/types.ts b/src/types.ts
+index fadf5ec..fb3caac 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -25,6 +25,7 @@ export type Member = {
+   id: number;
+   name: string;
+   role: MemberRole;
++  suspended: boolean;
+ };
+ 
+ export type Permission = {
+@@ -39,6 +40,7 @@ export type Loan = {
+   borrowed_at: string;
+   due_at: string;
+   returned_at: string | null;
++  renewal_count: number;
+ };
+ 
+ export type Fine = {
+@@ -58,6 +60,22 @@ export type Payment = {
+   received_by: number;
+ };
+ 
++export type Hold = {
++  id: number;
++  book_id: number;
++  member_id: number;
++  placed_at: string;
++  cancelled_at: string | null;
++};
++
++export type Waiver = {
++  id: number;
++  fine_id: number;
++  amount_cents: number;
++  waived_at: string;
++  waived_by: number;
++};
++
+ export type Report = {
+   id: number;
+   kind: string;

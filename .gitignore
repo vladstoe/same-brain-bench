@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+
+# local credentials, never committed
+.env.local
+
+# your own copy of bench.example.json
+bench.config.json
+
+# the bench roots and the seed repo the rig clones from
+/runs/
+/runs-dry/
+/.seed-repo/

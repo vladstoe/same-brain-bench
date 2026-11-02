@@ -1,0 +1,1 @@
+Now build all the tickets. Use whatever your environment offers for splitting the work across agents and reviewing it. Keep the existing tests passing.

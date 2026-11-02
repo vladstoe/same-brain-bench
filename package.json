@@ -1,0 +1,23 @@
+{
+  "name": "same-brain-bench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "rig": "./bin/rig"
+  },
+  "scripts": {
+    "rig": "tsx src/cli.ts",
+    "proxy": "tsx proxy/main.ts",
+    "typecheck": "tsc --noEmit",
+    "selftest": "tsx scripts/selftest.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.3",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3"
+  }
+}

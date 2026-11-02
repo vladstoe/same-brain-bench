@@ -1,0 +1,136 @@
+{
+  "protocol": "v3",
+  "prompts": {
+    "phaseA": "prompts/plan.txt",
+    "phaseB": "prompts/build.txt",
+    "approvalPolicy": "prompts/approval-policy.txt"
+  },
+  "k": 5,
+  "benchRoot": "./runs",
+  "seedRepoPath": "./.seed-repo",
+  "seedTag": "seed-v2",
+  "evaluatorDir": "evaluate",
+  "evaluatorVersion": "3.0.0",
+  "evaluatorCommand": [
+    "npm",
+    "--prefix",
+    "evaluate",
+    "run",
+    "--silent",
+    "evaluate",
+    "--"
+  ],
+  "apiKeyEnvVar": "COLD_HANDOFF_ANTHROPIC_API_KEY",
+  "auth": {
+    "mode": "subscription",
+    "allowApiKey": false,
+    "expectedProxyAuthForm": "bearer",
+    "claudeOauthTokenEnvVar": "CLAUDE_CODE_OAUTH_TOKEN",
+    "note": "Every arm runs on the Claude subscription. Cost stays API-equivalent USD from proxy-metered tokens; only the auth channel differs. No credential is ever written into the bench root."
+  },
+  "phaseTimeoutMs": 2700000,
+  "maxScriptedReplies": 3,
+  "phaseLimits": {
+    "A": {
+      "timeoutMs": 2700000,
+      "maxScriptedReplies": {
+        "C": 3,
+        "T": 5
+      }
+    },
+    "B": {
+      "timeoutMs": 7200000,
+      "maxScriptedReplies": {
+        "C": 10,
+        "T": 10
+      }
+    }
+  },
+  "phaseLimitsNote": "Phase A is the plan turn and phase B the build turn of one conversation. 45 minutes to plan and 120 to build; scripted replies capped at 3 (arm C) and 5 (arm T) for the plan, 10 in both arms for the build.",
+  "reconcileTolerance": 0.02,
+  "effort": "high",
+  "effortNote": "Every agent of both arms at this level: arm C as claude --effort, arm T's coordinator as traycer agent create --reasoning-effort, its children through the bench selection guide.",
+  "attributeCalls": true,
+  "phaseAReply": "question",
+  "harnessEnv": {
+    "ENABLE_TOOL_SEARCH": "true",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "opus[1m]",
+    "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"
+  },
+  "harnessEnvNote": "Both arms' Claude Code gets these: arm C in its spawn environment, arm T through the provider override. Behind a non-Anthropic ANTHROPIC_BASE_URL such as the rig proxy, Claude Code switches tool search off unless ENABLE_TOOL_SEARCH is set, as found on 2.1.284. With it true, the 2.1.293 probes found both arms' sessions carrying deferred-tool attachments, so tool search is on, as in daily use. CLAUDE_CODE_SUBAGENT_MODEL pins every subagent to the arms' own model value. With CLAUDE_CODE_SUBAGENT_MODEL_FORCE set, 2.1.293's model resolution discards any per-call or workflow model, and its instructions tell agents \"The model parameter is ignored on this session. Do not set it.\" In the probes, both arms' subagents ran on claude-opus-5-5 at high.",
+  "claudeBinary": "~/.traycer/host/providers/claude/darwin-arm64/2.1.293/claude",
+  "claudeBinaryNote": "Arm C runs the binary Traycer bundles, so arms C and T share one Claude Code build. Must match providers/claude/darwin-arm64/current.json, which preflight checks: 2.1.259 does not know claude-opus-5-5, so a stale pin silently puts the two arms on different models.",
+  "model": {
+    "id": "claude-opus-5-5",
+    "verified": true,
+    "note": "Wire id resolved by the 2026-09-24 smoke run: opus[1m] -> claude-opus-5-5. Arms C and T pass the opus[1m] alias to the same Claude Code binary, which rejects the full id as --model. The resolved id on the wire is what preflight asserts.",
+    "armModelRef": {
+      "C": "opus[1m]",
+      "T": "opus[1m]"
+    }
+  },
+  "traycer": {
+    "cliPath": "~/.traycer/cli/bin/traycer",
+    "epicsRoot": "~/.traycer/epics",
+    "providerOverridesPath": "~/.traycer/host/config/provider-overrides.json",
+    "providerId": "claude-code",
+    "harness": "claude",
+    "maxScriptedReplies": 5,
+    "pollIntervalMs": 5000,
+    "artifactSettleMs": 15000,
+    "skillPrefixPhaseA": "",
+    "ticketBreakdownMessage": "",
+    "overrideEnv": {
+      "ENABLE_CLAUDEAI_MCP_SERVERS": "false"
+    },
+    "overrideEnvNote": "Arm T's override only, set and cleared with the routing. ENABLE_CLAUDEAI_MCP_SERVERS=false works on 2.1.293: the probe's arm-T sessions loaded no claude.ai connector tools at start-up. CLAUDE_CODE_DISABLE_POLICY_SKILLS was dropped: with it set to 1, both arm-T probe sessions still listed the 33 account plugin skills and three artifact skills, about 13,000 characters or 3,250 tokens, and 2.1.293 has no switch for user-installed plugins. Arm C's isolated config lists none of them, so arm T's fixed prompt carries them and arm C's does not.",
+    "selectionGuidePath": "~/.traycer/agent-selection-guide.md",
+    "smoke": {
+      "epic": null,
+      "sender": null
+    },
+    "attempts": {
+      "1": {
+        "epic": null,
+        "sender": null
+      },
+      "2": {
+        "epic": null,
+        "sender": null
+      },
+      "3": {
+        "epic": null,
+        "sender": null
+      },
+      "4": {
+        "epic": null,
+        "sender": null
+      },
+      "5": {
+        "epic": null,
+        "sender": null
+      }
+    },
+    "attemptsNote": "Placeholders. Create each epic by hand in the Traycer app: one for the smoke run (attempt 0) and one per attempt 1 to k, each with one sender agent switched off the claude harness. Record each epic id and its sender agent id here. An attempt excluded for an infrastructure fault is re-run under the next n, which needs an epic of its own.",
+    "retireAgents": true
+  },
+  "proxy": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "upstream": "https://api.anthropic.com"
+  },
+  "prices": {
+    "model": "claude-opus-5-5",
+    "currency": "USD",
+    "unit": "per million tokens",
+    "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+    "verifiedOn": "2026-09-24",
+    "placeholder": false,
+    "input": 4,
+    "output": 20,
+    "cacheRead": 0.2,
+    "cacheWrite5m": 5,
+    "cacheWrite1h": 8
+  },
+  "protocolNote": "v3: one conversation of two turns, plan then build. Each tool delegates its own way: Traycer's coordinator creates child agents, Claude Code's session uses subagents. Nine features on seed v2 under six rules, graded by evaluator 3.0.0. Every agent of both arms is pinned to one model and effort, measured per agent, and an attempt with an agent off the pin is excluded."
+}

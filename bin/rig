@@ -1,0 +1,3 @@
+#!/bin/sh
+root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+exec "$root/node_modules/.bin/tsx" "$root/src/cli.ts" "$@"

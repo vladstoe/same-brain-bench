@@ -1,0 +1,145 @@
+Fixture: broken — the ten new routes exist behind their guards, with permission rows, and every one of them raises; nothing completes.
+
+diff --git a/src/app.ts b/src/app.ts
+index 34ad6d6..9f4b8f7 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -9,6 +9,7 @@ import { authors } from './routes/authors.js';
+ import { books } from './routes/books.js';
+ import { copies } from './routes/copies.js';
+ import { fines } from './routes/fines.js';
++import { holds } from './routes/holds.js';
+ import { jobs } from './routes/jobs.js';
+ import { loans } from './routes/loans.js';
+ import { members } from './routes/members.js';
+@@ -36,6 +37,7 @@ export function createApp(db: Db, options: AppOptions = {}): Hono<AppEnv> {
+   app.route('/', members);
+   app.route('/', permissions);
+   app.route('/', loans);
++  app.route('/', holds);
+   app.route('/', fines);
+   app.route('/', payments);
+   app.route('/', reports);
+diff --git a/src/migrations/008_holds.sql b/src/migrations/008_holds.sql
+new file mode 100644
+index 0000000..ea5d881
+--- /dev/null
++++ b/src/migrations/008_holds.sql
+@@ -0,0 +1,25 @@
++INSERT INTO permissions (role, action) VALUES
++  ('patron', 'holds.place'),
++  ('patron', 'holds.cancel'),
++  ('patron', 'holds.read'),
++  ('patron', 'statements.read'),
++  ('clerk', 'holds.place'),
++  ('clerk', 'holds.cancel'),
++  ('clerk', 'holds.read'),
++  ('clerk', 'statements.read'),
++  ('librarian', 'holds.place'),
++  ('librarian', 'holds.cancel'),
++  ('librarian', 'holds.read'),
++  ('librarian', 'holds.read_any'),
++  ('librarian', 'fines.waive'),
++  ('librarian', 'members.suspend'),
++  ('librarian', 'statements.read'),
++  ('librarian', 'statements.read_any'),
++  ('admin', 'holds.place'),
++  ('admin', 'holds.cancel'),
++  ('admin', 'holds.read'),
++  ('admin', 'holds.read_any'),
++  ('admin', 'fines.waive'),
++  ('admin', 'members.suspend'),
++  ('admin', 'statements.read'),
++  ('admin', 'statements.read_any');
+diff --git a/src/routes/fines.ts b/src/routes/fines.ts
+index 106cba1..f16b709 100644
+--- a/src/routes/fines.ts
++++ b/src/routes/fines.ts
+@@ -124,3 +124,14 @@ fines.get('/fines/:id', requirePermission('fines.read'), (c) => {
+     .all(fine.id) as Payment[];
+   return c.json({ ...fine, payments: finePayments });
+ });
++
++fines.post('/fines/:id/waive', requirePermission('fines.waive'), (c) => {
++  const db = c.get('db');
++  const waiver = db.prepare('SELECT * FROM waivers WHERE fine_id = ?').get(idParam(c));
++  return c.json(waiver);
++});
++
++fines.get('/members/:id/statement', requirePermission('statements.read'), (c) => {
++  const db = c.get('db');
++  return c.json(db.prepare('SELECT * FROM statements WHERE member_id = ?').get(idParam(c)));
++});
+diff --git a/src/routes/holds.ts b/src/routes/holds.ts
+new file mode 100644
+index 0000000..cce9a4c
+--- /dev/null
++++ b/src/routes/holds.ts
+@@ -0,0 +1,28 @@
++import { Hono } from 'hono';
++import type { AppEnv } from '../db.js';
++import { requirePermission } from '../guards.js';
++import { idParam } from '../http.js';
++
++export const holds = new Hono<AppEnv>();
++
++holds.post('/books/:id/holds', requirePermission('holds.place'), (c) => {
++  const db = c.get('db');
++  const hold = db.prepare('SELECT * FROM holds WHERE book_id = ?').get(idParam(c));
++  return c.json(hold, 201);
++});
++
++holds.post('/holds/:id/cancel', requirePermission('holds.cancel'), (c) => {
++  const db = c.get('db');
++  const hold = db.prepare('SELECT * FROM holds WHERE id = ?').get(idParam(c));
++  return c.json(hold);
++});
++
++holds.get('/books/:id/holds', requirePermission('holds.read_any'), (c) => {
++  const db = c.get('db');
++  return c.json(db.prepare('SELECT * FROM holds WHERE book_id = ?').all(idParam(c)));
++});
++
++holds.get('/members/:id/holds', requirePermission('holds.read'), (c) => {
++  const db = c.get('db');
++  return c.json(db.prepare('SELECT * FROM holds WHERE member_id = ?').all(idParam(c)));
++});
+diff --git a/src/routes/members.ts b/src/routes/members.ts
+index 4b7f3df..ab37313 100644
+--- a/src/routes/members.ts
++++ b/src/routes/members.ts
+@@ -136,3 +136,13 @@ members.delete('/members/:id', requirePermission('members.write'), (c) => {
+ 
+   return c.body(null, 204);
+ });
++
++members.post('/members/:id/suspend', requirePermission('members.suspend'), (c) => {
++  const db = c.get('db');
++  return c.json(db.prepare('SELECT * FROM member_suspensions WHERE member_id = ?').get(idParam(c)));
++});
++
++members.post('/members/:id/unsuspend', requirePermission('members.suspend'), (c) => {
++  const db = c.get('db');
++  return c.json(db.prepare('SELECT * FROM member_suspensions WHERE member_id = ?').get(idParam(c)));
++});
+diff --git a/src/routes/reports.ts b/src/routes/reports.ts
+index 21ba2b7..7e8e5c7 100644
+--- a/src/routes/reports.ts
++++ b/src/routes/reports.ts
+@@ -58,6 +58,16 @@ reports.get('/reports/daily/latest', requirePermission('reports.read'), (c) => {
+   return c.json(present(report));
+ });
+ 
++reports.get('/reports/nightly/latest', requirePermission('reports.read'), (c) => {
++  const report = c.get('db').prepare('SELECT * FROM nightly_reports ORDER BY id DESC').get();
++  return c.json(report);
++});
++
++reports.get('/reports/weekly/latest', requirePermission('reports.read'), (c) => {
++  const report = c.get('db').prepare('SELECT * FROM weekly_reports ORDER BY id DESC').get();
++  return c.json(report);
++});
++
+ reports.get('/reports/:id', requirePermission('reports.read'), (c) => {
+   return c.json(present(findReport(c.get('db'), idParam(c))));
+ });
