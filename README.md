@@ -1,7 +1,3 @@
-# same-brain-bench
-
-Written by Vlad Stoenescu.
-
 ## What this is
 
 This is the benchmark behind my blog post, [Same model, better habits](BLOG_POST_URL) <!-- TODO: replace BLOG_POST_URL with the link to the post -->, and the [comic](https://vladstoe.github.io/same-brain-comic/) that goes with it. I gave Claude Code and Claude Code inside Traycer the same job, the same model and the same settings, five times each, and graded every result with a checker I wrote before the first run. This repo holds everything I ran: the rig that drives both tools, the metering proxy, the checker and its test fixtures, the frozen prompts and the codebase they worked on. You can read it to see exactly what I tested, or run it yourself.
